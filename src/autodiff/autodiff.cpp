@@ -414,6 +414,86 @@ Index Tape<Value>::append_gather(const Int64 &offset, const Mask &mask) {
     }
 }
 
+
+template <typename Value>
+Index Tape<Value>::append_gather_linear(const Float32 &offset, const Mask &mask) {
+    if constexpr (is_dynamic_v<Value>) {
+        if (d->scatter_gather_index == nullptr ||
+           *d->scatter_gather_index == 0)
+            return 0;
+        Index source = *d->scatter_gather_index;
+
+        struct Gather : Special {
+            Int64   offset_i;
+            Float32 f, rf;
+            Mask mask;
+            size_t size;
+            bool permute;
+
+            void forward(Detail *detail, Index target_idx,
+                         const Edge &edge) const override {
+                const Value &grad_source = detail->node(edge.source).grad;
+                Value &grad_target = detail->node(target_idx).grad;
+
+                if (grad_source.size() != size)
+                    throw std::runtime_error("Internal error in Gather::forward()!");
+
+                Value value_0 = gather<Value>(grad_source, offset_i,   mask);
+                Value value_1 = gather<Value>(grad_source, offset_i+1, mask);
+
+                Value value = rf * value_0 + f * value_1;
+
+                if (grad_target.empty())
+                    grad_target = value;
+                else
+                    grad_target += value;
+            }
+
+            void backward(Detail *detail, Index target_idx,
+                          const Edge &edge) const override {
+                const Value &grad_target = detail->node(target_idx).grad;
+                Value &grad_source = detail->node(edge.source).grad;
+
+                if (grad_source.empty())
+                    grad_source = zero<Value>(size);
+                else if (grad_source.size() != size)
+                    throw std::runtime_error("Internal error in Gather::backward()!");
+
+                if (permute)
+                    scatter(grad_source, rf * grad_target,    offset_i, mask);
+                else
+                    scatter_add(grad_source, rf * grad_target, offset_i, mask);
+
+                scatter_add(grad_source, f * grad_target, offset_i + 1, mask);
+            }
+        };
+
+        Gather *gather = new Gather();
+
+        gather->offset_i = enoki::floor2int<Int64>(offset);
+        gather->f = offset - Float32(gather->offset_i);
+        gather->rf = 1.f - gather->f;
+
+        gather->mask = mask;
+        gather->size = d->scatter_gather_size;
+        gather->permute = d->scatter_gather_permute;
+
+        Index target = append_node(slices(offset), "gather");
+        d->node(target).edges.emplace_back(source, gather);
+        inc_ref_int(source, target);
+
+#if !defined(NDEBUG)
+        if (d->log_level >= 3)
+            std::cerr << "autodiff: append_gather(" << target << " <- " << source << ")"
+                      << std::endl;
+#endif
+
+        return target;
+    } else {
+        return 0;
+    }
+}
+
 template <typename Value>
 void Tape<Value>::append_scatter(Index source, const Int64 &offset, const Mask &mask, bool scatter_add) {
     if constexpr (is_dynamic_v<Value>) {

@@ -33,6 +33,7 @@ private:
     using Index = uint32_t;
     using Mask = mask_t<Type>;
     using Int64 = int64_array_t<Type>;
+    using Float32 = float32_array_t<Type>;
 
     Tape();
     ~Tape();
@@ -50,6 +51,8 @@ private:
                  const Type &w1, const Type &w2, const Type &w3);
 
     Index append_gather(const Int64 &offset, const Mask &mask);
+
+    Index append_gather_linear(const Float32 &offset, const Mask &mask);
 
     void append_scatter(Index index, const Int64 &offset, const Mask &mask,
                         bool scatter_add);
@@ -938,8 +941,73 @@ public:
         if constexpr (Enabled)
             index_new = tape()->append_gather(offset.value_(), mask.value_());
 
+        std::cout << "index_new: " << index_new << std::endl;
+
         return DiffArray::create(index_new, std::move(result));
     }
+
+    template <typename Array, typename OffsetFD, typename Mask, typename Source>
+    static DiffArray gather_linear(const Source &source, const OffsetFD &offset_fd,
+                                   Mask active = true) {
+
+        if constexpr (is_diff_array_v<Source>) {
+            Source::set_scatter_gather_operand_(source, false);
+            if constexpr (is_cuda_array_v<Source>)
+                cuda_set_scatter_gather_operand(source.value_().index_(), true);
+        } else if constexpr (is_cuda_array_v<Source>) {
+            cuda_set_scatter_gather_operand(source.index_(), true);
+        }
+
+        using OffsetF = typename OffsetFD::UnderlyingType;
+        using OffsetI = replace_scalar_t<OffsetF, size_t>;
+
+        std::cout << "gather_linear(...)" << std::endl;
+
+        constexpr size_t Stride  = sizeof(scalar_t<Array>);
+
+        static_assert(!Enabled || Stride == sizeof(Scalar),
+                      "Differentiable gather: unsupported stride!");
+
+        size_t max_coordinates = slices(source);
+        // std::cout << "max_coordinates: " << max_coordinates << std::endl;
+
+        // ---- Compute offsets ----
+
+        OffsetF offset_f = offset_fd.value_();
+
+        // Integer part (clamped to include the upper bound)
+        OffsetI offset_i  = enoki::floor2int<OffsetI>(offset_f);
+        offset_i[active] = clamp(offset_i, 0, max_coordinates - 1);
+
+        // Fractional part
+        OffsetF f = offset_f - OffsetF(offset_i), rf = 1.f - f;
+
+        active &= all(offset_i >= 0 && (offset_i + 1) < max_coordinates);
+
+        // std::cout << "offset_f: " << offset_f << " - offset_i: " << offset_i << std::endl;
+        // std::cout << "f: " << f << " - rf: " << rf << std::endl;
+
+        // ---- Gather all data ----
+        Type result_0 = gather<Type, Stride>(source.data(), offset_i+0, active.value_());
+        Type result_1 = gather<Type, Stride>(source.data(), offset_i+1, active.value_());
+
+        Type result = rf * result_0 + f * result_1;
+
+        Index index_new = 0;
+        if constexpr (Enabled)
+            index_new = tape()->append_gather_linear(offset_f, active.value_());
+
+        if constexpr (is_diff_array_v<Source>) {
+            Source::clear_scatter_gather_operand_();
+            if constexpr (is_cuda_array_v<Source>)
+                cuda_set_scatter_gather_operand(0);
+        } else if constexpr (is_cuda_array_v<Source>) {
+            cuda_set_scatter_gather_operand(0);
+        }
+
+        return DiffArray::create(index_new, std::move(result));
+    }
+
 
     template <size_t Stride, typename Offset, typename Mask>
     void scatter_(void *ptr, const Offset &offset, const Mask &mask) const {
