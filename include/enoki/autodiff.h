@@ -52,7 +52,8 @@ private:
 
     Index append_gather(const Int64 &offset, const Mask &mask);
 
-    Index append_gather_linear(const Float32 &offset, const Mask &mask);
+    template<typename Offset, typename Size>
+    Index append_gather_interpolation(const Offset &offset, const Size &source_dim, const Mask &mask);
 
     void append_scatter(Index index, const Int64 &offset, const Mask &mask,
                         bool scatter_add);
@@ -941,14 +942,16 @@ public:
         if constexpr (Enabled)
             index_new = tape()->append_gather(offset.value_(), mask.value_());
 
-        std::cout << "index_new: " << index_new << std::endl;
+        // std::cout << "index_new: " << index_new << std::endl;
 
         return DiffArray::create(index_new, std::move(result));
     }
 
-    template <typename Array, typename OffsetFD, typename Mask, typename Source>
-    static DiffArray gather_linear(const Source &source, const OffsetFD &offset_fd,
-                                   Mask active = true) {
+    template <typename Source, typename OffsetF, typename Size, typename Mask>
+    static DiffArray gather_interpolation(const Source &source,
+                                          const OffsetF &offset_f,
+                                          const Size &source_dim,
+                                          Mask active = true) {
 
         if constexpr (is_diff_array_v<Source>) {
             Source::set_scatter_gather_operand_(source, false);
@@ -958,44 +961,66 @@ public:
             cuda_set_scatter_gather_operand(source.index_(), true);
         }
 
-        using OffsetF = typename OffsetFD::UnderlyingType;
         using OffsetI = replace_scalar_t<OffsetF, size_t>;
 
-        std::cout << "gather_linear(...)" << std::endl;
+        constexpr size_t Stride  = sizeof(scalar_t<DiffArray>);
 
-        constexpr size_t Stride  = sizeof(scalar_t<Array>);
+        constexpr size_t OffsetDim = array_size_v<OffsetF> == Dynamic ? 1 : array_size_v<OffsetF>;
+
+        static_assert(OffsetDim == array_size_v<Size>);
 
         static_assert(!Enabled || Stride == sizeof(Scalar),
                       "Differentiable gather: unsupported stride!");
 
-        size_t max_coordinates = slices(source);
-        // std::cout << "max_coordinates: " << max_coordinates << std::endl;
-
-        // ---- Compute offsets ----
-
-        OffsetF offset_f = offset_fd.value_();
+        if (hprod(source_dim) != slices(source))
+            throw std::runtime_error("Error in gather_interpolation: source dimensions don't match size of data array!");
 
         // Integer part (clamped to include the upper bound)
-        OffsetI offset_i  = enoki::floor2int<OffsetI>(offset_f);
-        offset_i[active] = clamp(offset_i, 0, max_coordinates - 1);
+        OffsetI offset_i = enoki::floor2int<OffsetI>(offset_f);
+        masked(offset_i, active) = clamp(offset_i, 0, source_dim - 1);
 
         // Fractional part
         OffsetF f = offset_f - OffsetF(offset_i), rf = 1.f - f;
 
-        active &= all(offset_i >= 0 && (offset_i + 1) < max_coordinates);
-
-        // std::cout << "offset_f: " << offset_f << " - offset_i: " << offset_i << std::endl;
-        // std::cout << "f: " << f << " - rf: " << rf << std::endl;
-
-        // ---- Gather all data ----
-        Type result_0 = gather<Type, Stride>(source.data(), offset_i+0, active.value_());
-        Type result_1 = gather<Type, Stride>(source.data(), offset_i+1, active.value_());
-
-        Type result = rf * result_0 + f * result_1;
-
+        Type result  = 0;
         Index index_new = 0;
+
+        if constexpr (OffsetDim == 1) {
+            // ---- Gather all data ----
+            Type result_0 = gather<Type, Stride>(source.data(), offset_i+0, active);
+            Type result_1 = gather<Type, Stride>(source.data(), offset_i+1, active && (offset_i+1) < source_dim);
+
+            result = rf * result_0 + f * result_1;
+        } else {
+            size_t strides[OffsetDim];
+            size_t tmp = hprod(source_dim);
+
+            value_t<OffsetI> idx = 0;
+            for (size_t d = 0; d < OffsetDim; d++) {
+                tmp /= source_dim[d];
+                strides[d] = tmp;
+                idx += offset_i[d] * tmp;
+            }
+
+            for (size_t i = 0; i < 1 << OffsetDim; i++) {
+                size_t offset = 0;
+                value_t<OffsetF> mult = 1.f;
+                mask_t<value_t<OffsetF>> valid = active;
+
+                for (size_t d = 0; d < OffsetDim; d++) {
+                    size_t b = ((i >> d) & 1);
+                    offset += strides[d] * b;
+                    mult *= rf[d] * (1 - b) + f[d] * b;
+
+                    valid &= mask_t<value_t<OffsetF>>((b == 0)) || (offset_i[d] + 1 < source_dim[d]);
+                }
+
+                result += mult * gather<Type, Stride>(source.data(), idx + offset, valid);
+            }
+        }
+
         if constexpr (Enabled)
-            index_new = tape()->append_gather_linear(offset_f, active.value_());
+            index_new = tape()->append_gather_interpolation(offset_f, source_dim, active);
 
         if constexpr (is_diff_array_v<Source>) {
             Source::clear_scatter_gather_operand_();

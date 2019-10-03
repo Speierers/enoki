@@ -416,7 +416,14 @@ Index Tape<Value>::append_gather(const Int64 &offset, const Mask &mask) {
 
 
 template <typename Value>
-Index Tape<Value>::append_gather_linear(const Float32 &offset, const Mask &mask) {
+template<typename OffsetF, typename Size>
+Index Tape<Value>::append_gather_interpolation(const OffsetF &offset,
+                                               const Size &source_dim,
+                                               const Mask &mask) {
+    using OffsetI = replace_scalar_t<OffsetF, size_t>;
+    constexpr size_t OffsetDim
+        = (array_size_v<OffsetF> == Dynamic) ? 1 : array_size_v<OffsetF>;
+
     if constexpr (is_dynamic_v<Value>) {
         if (d->scatter_gather_index == nullptr ||
            *d->scatter_gather_index == 0)
@@ -424,9 +431,10 @@ Index Tape<Value>::append_gather_linear(const Float32 &offset, const Mask &mask)
         Index source = *d->scatter_gather_index;
 
         struct Gather : Special {
-            Int64   offset_i;
-            Float32 f, rf;
+            OffsetI offset_i;
+            OffsetF f, rf;
             Mask mask;
+            Size source_dim;
             size_t size;
             bool permute;
 
@@ -438,10 +446,40 @@ Index Tape<Value>::append_gather_linear(const Float32 &offset, const Mask &mask)
                 if (grad_source.size() != size)
                     throw std::runtime_error("Internal error in Gather::forward()!");
 
-                Value value_0 = gather<Value>(grad_source, offset_i,   mask);
-                Value value_1 = gather<Value>(grad_source, offset_i+1, mask);
+                Value value(0);
 
-                Value value = rf * value_0 + f * value_1;
+                if constexpr (OffsetDim == 1) {
+                    Value value_0 = gather<Value>(grad_source, offset_i,   mask);
+                    Value value_1 = gather<Value>(grad_source, offset_i+1, mask);
+
+                    value = rf * value_0 + f * value_1;
+                } else {
+                    size_t strides[OffsetDim];
+                    size_t tmp = hprod(source_dim);
+
+                    value_t<OffsetI> idx = 0;
+                    for (size_t d = 0; d < OffsetDim; d++) {
+                        tmp /= source_dim[d];
+                        strides[d] = tmp;
+                        idx += offset_i[d] * tmp;
+                    }
+
+                    for (size_t i = 0; i < 1 << OffsetDim; i++) {
+                        size_t offset = 0;
+                        value_t<OffsetF> mult = 1.f;
+                        mask_t<value_t<OffsetF>> valid = mask;
+
+                        for (size_t d = 0; d < OffsetDim; d++) {
+                            size_t b = ((i >> d) & 1);
+                            offset += strides[d] * b;
+                            mult *= rf[d] * (1 - b) + f[d] * b;
+
+                            valid &= mask_t<value_t<OffsetF>>((b == 0)) || (offset_i[d] + 1 < source_dim[d]);
+                        }
+
+                        value += mult * gather<Value>(grad_source, idx + offset, valid);
+                    }
+                }
 
                 if (grad_target.empty())
                     grad_target = value;
@@ -458,27 +496,58 @@ Index Tape<Value>::append_gather_linear(const Float32 &offset, const Mask &mask)
                     grad_source = zero<Value>(size);
                 else if (grad_source.size() != size)
                     throw std::runtime_error("Internal error in Gather::backward()!");
+                if constexpr (OffsetDim == 1) {
+                    if (permute)
+                        scatter(grad_source, rf * grad_target,    offset_i, mask);
+                    else
+                        scatter_add(grad_source, rf * grad_target, offset_i, mask);
 
-                if (permute)
-                    scatter(grad_source, rf * grad_target,    offset_i, mask);
-                else
-                    scatter_add(grad_source, rf * grad_target, offset_i, mask);
+                    scatter_add(grad_source, f * grad_target, offset_i + 1, mask);
+                } else {
+                    size_t strides[OffsetDim];
+                    size_t tmp = hprod(source_dim);
 
-                scatter_add(grad_source, f * grad_target, offset_i + 1, mask);
+                    value_t<OffsetI> idx = 0;
+                    for (size_t d = 0; d < OffsetDim; d++) {
+                        tmp /= source_dim[d];
+                        strides[d] = tmp;
+                        idx += offset_i[d] * tmp;
+                    }
+
+                    for (size_t i = 0; i < 1 << OffsetDim; i++) {
+                        size_t offset = 0;
+                        value_t<OffsetF> mult = 1.f;
+                        mask_t<value_t<OffsetF>> valid = mask;
+
+                        for (size_t d = 0; d < OffsetDim; d++) {
+                            size_t b = ((i >> d) & 1);
+                            offset += strides[d] * b;
+                            mult *= rf[d] * (1 - b) + f[d] * b;
+
+                            valid &= mask_t<value_t<OffsetF>>((b == 0)) || (offset_i[d] + 1 < source_dim[d]);
+                        }
+
+                        if (permute && offset == 0)
+                            scatter(grad_source, mult * grad_target,     idx + offset, valid);
+                        else
+                            scatter_add(grad_source, mult * grad_target, idx + offset, valid);
+                    }
+                }
             }
         };
 
         Gather *gather = new Gather();
 
-        gather->offset_i = enoki::floor2int<Int64>(offset);
-        gather->f = offset - Float32(gather->offset_i);
+        gather->offset_i = enoki::floor2int<OffsetI>(offset);
+        gather->f = offset - OffsetF(gather->offset_i);
         gather->rf = 1.f - gather->f;
 
+        gather->source_dim = source_dim;
         gather->mask = mask;
         gather->size = d->scatter_gather_size;
         gather->permute = d->scatter_gather_permute;
 
-        Index target = append_node(slices(offset), "gather");
+        Index target = append_node(slices(offset), "gather_linear");
         d->node(target).edges.emplace_back(source, gather);
         inc_ref_int(source, target);
 
@@ -1192,6 +1261,7 @@ template <typename Value> Value safe_fmadd(const Value &value1, const Value &val
 
 template struct ENOKI_EXPORT Tape<float>;
 template struct ENOKI_EXPORT DiffArray<float>;
+template ENOKI_EXPORT Index Tape<float>::append_gather_interpolation<float, size_t>(const float&, const size_t&, const bool&);
 
 template struct ENOKI_EXPORT Tape<double>;
 template struct ENOKI_EXPORT DiffArray<double>;
@@ -1208,6 +1278,11 @@ template struct ENOKI_EXPORT DiffArray<CUDAArray<float>>;
 
 template struct ENOKI_EXPORT Tape<CUDAArray<double>>;
 template struct ENOKI_EXPORT DiffArray<CUDAArray<double>>;
+
+template ENOKI_EXPORT Index Tape<CUDAArray<float>>::append_gather_interpolation<CUDAArray<float>, size_t>(const CUDAArray<float>&, const size_t&, const mask_t<CUDAArray<float>>&);
+template ENOKI_EXPORT Index Tape<CUDAArray<float>>::append_gather_interpolation<Array<CUDAArray<float>, 2>, Array<size_t, 2>>(const Array<CUDAArray<float>, 2>&, const Array<size_t, 2>&, const mask_t<CUDAArray<float>>&);
+template ENOKI_EXPORT Index Tape<CUDAArray<float>>::append_gather_interpolation<Array<CUDAArray<float>, 3>, Array<size_t, 3>>(const Array<CUDAArray<float>, 3>&, const Array<size_t, 3>&, const mask_t<CUDAArray<float>>&);
 #endif
+
 
 NAMESPACE_END(enoki)
